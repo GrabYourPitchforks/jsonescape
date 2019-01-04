@@ -149,7 +149,7 @@ namespace Escaper
         {
             if (utf8Input.IsEmpty)
             {
-                goto ReturnIncomplete;
+                goto Error;
             }
 
             uint firstByte = utf8Input[0];
@@ -173,17 +173,17 @@ namespace Escaper
 
                 if (utf8Input.Length < 2)
                 {
-                    goto ReturnIncomplete; // 2-byte header with no trailing data
+                    goto Error;
                 }
 
                 int secondByteSigned = (sbyte)utf8Input[1];
                 if (secondByteSigned > unchecked((sbyte)0xBF))
                 {
-                    goto ReturnInvalid1; // 2-byte header followed by non-continuation byte
+                    goto Error;
                 }
 
                 bytesConsumed = 2;
-                return (int)(firstByteModified << 6) + secondByteSigned - ((0xC0 << 6) + unchecked((sbyte)0x80));
+                return (int)(firstByteModified << 6) + secondByteSigned + (0x02 << 6) + unchecked((sbyte)0x80);
             }
 
             if ((byte)firstByteModified <= 0xEFu - 0xC2u)
@@ -191,40 +191,267 @@ namespace Escaper
                 // This is presumably the start of a 3-byte sequence, but need to confirm.
                 // [ 1110zzzz 10yyyyyy 10xxxxxx ]
 
-                if (utf8Input.Length >= 3)
+                if (utf8Input.Length < 3)
                 {
-                    int secondByteSigned = (sbyte)utf8Input[1];
-                    if (secondByteSigned > unchecked((sbyte)0xBF))
-                    {
-                        goto ReturnInvalid1; // 2-byte header followed by non-continuation byte
-                    }
-
-                    // perform overlong and surrogate checks now
-
-
-
-                    int thirdByteSigned = (sbyte)utf8Input[2];
-                    if (thirdByteSigned>unchecked((sbyte)0xBF))
-                    {
-
-                    }
+                    goto Error;
                 }
+
+                int secondByteSigned = (sbyte)utf8Input[1];
+                if (secondByteSigned > unchecked((sbyte)0xBF))
+                {
+                    goto Error;
+                }
+
+                // perform overlong check now
+
+                uint firstAndSecondBytes = (firstByteModified << 6) + (uint)secondByteSigned;
+                if (firstAndSecondBytes < unchecked(((0xE0u - 0xC2u) << 6) + 0xFFFFFFA0u))
+                {
+                    goto Error;
+                }
+
+                // perform surrogate check now
+
+                if (IsBetweenInclusive(firstAndSecondBytes, unchecked(((0xEDu - 0xC2u) << 6) + 0xFFFFFF9Fu), unchecked(((0xEDu - 0xC2u) << 6) + 0xFFFFFFBFu)))
+                {
+                    goto Error;
+                }
+
+                int thirdByteSigned = (sbyte)utf8Input[2];
+                if (thirdByteSigned > unchecked((sbyte)0xBF))
+                {
+                    goto Error;
+                }
+
+                bytesConsumed = 3;
+                return (int)(firstAndSecondBytes << 6) + thirdByteSigned + unchecked((0xC2 << 12) - (0xE0 << 12) - ((sbyte)0x80 << 6) - (sbyte)0x80);
             }
 
-        ReturnIncomplete:
-            bytesConsumed = utf8Input.Length;
-            return SCALAR_INCOMPLETE;
+            if ((byte)firstByteModified <= 0xF4u - 0xC2u)
+            {
+                // This is presumably the start of a 4-byte sequence, but need to confirm.
+                // [ 11110uuu 10uuzzzz 10yyyyyy 10xxxxxx ]
 
-        ReturnInvalid1:
+                if (utf8Input.Length < 4)
+                {
+                    goto Error;
+                }
+
+                int secondByteSigned = (sbyte)utf8Input[1];
+                if (secondByteSigned > unchecked((sbyte)0xBF))
+                {
+                    goto Error;
+                }
+
+                // perform overlong and out-of-range check now
+
+                uint firstAndSecondBytes = (firstByteModified << 6) + (uint)secondByteSigned;
+                if (!IsBetweenInclusive(firstAndSecondBytes, unchecked(((0xF0u - 0xC2u) << 6) + 0xFFFFFF90u), unchecked(((0xF4u - 0xC2u) << 6) + 0xFFFFFF8Fu)))
+                {
+                    goto Error;
+                }
+
+                int thirdByteSigned = (sbyte)utf8Input[2];
+                if (thirdByteSigned > unchecked((sbyte)0xBF))
+                {
+                    goto Error;
+                }
+
+                int fourthByteSigned = (sbyte)utf8Input[3];
+                if (fourthByteSigned > unchecked((sbyte)0xBF))
+                {
+                    goto Error;
+                }
+
+                int thirdAndFourthBytes = (thirdByteSigned << 6) + fourthByteSigned;
+
+                bytesConsumed = 4;
+                return (int)(firstAndSecondBytes << 12) + thirdAndFourthBytes + unchecked((0xC2 << 18) - (0xF0 << 18) - ((sbyte)0x80 << 12) - ((sbyte)0x80 << 6) - (sbyte)0x80);
+            }
+
+        Error:
+            return GetNextScalarValueFromUtf8_ErrorHandler(utf8Input, out bytesConsumed);
+        }
+
+        private static int GetNextScalarValueFromUtf8_ErrorHandler(ReadOnlySpan<byte> utf8Input, out int bytesConsumed)
+        {
+            // This is the error handling logic for when we can't read a scalar value from the input because the
+            // input does not represent valid UTF-8. It's ok for this logic to be slow since this is an error handling
+            // code path; the caller should be optimized for well-formed input.
+
+            // There's a race condition here in that it's possible that the UTF-8 was ill-formed when the fast-path method
+            // inspected the data, but between that method running and this error handling method running some other thread
+            // may have updated the buffer to contain well-formed data. We're not too worried about detecting this situation
+            // since our API contracts require the buffers to be stable, so we'll just return any arbitrary error.
+
+            if (utf8Input.IsEmpty)
+            {
+                bytesConsumed = 0;
+                return SCALAR_INCOMPLETE;
+            }
+
+            uint firstByte = utf8Input[0];
+
+            if (firstByte <= 0xC1u)
+            {
+                // 80..C1 will never begin a valid UTF-8 sequence.
+
+                bytesConsumed = 1;
+                return SCALAR_INVALID;
+            }
+
+            if (firstByte <= 0xDFu)
+            {
+                // 2-byte sequence marker
+
+                if (utf8Input.Length < 2)
+                {
+                    bytesConsumed = 1;
+                    return SCALAR_INCOMPLETE;
+                }
+
+                // only alternative was that the second byte wasn't a valid continuation byte
+                // that's a maximally invalid subsequence of length 1
+
+                bytesConsumed = 1;
+                return SCALAR_INVALID;
+            }
+
+            if (firstByte <= 0xEFu)
+            {
+                // 3-byte sequence marker
+
+                if (utf8Input.Length < 2)
+                {
+                    bytesConsumed = 1;
+                    return SCALAR_INCOMPLETE;
+                }
+
+                if (firstByte == 0xE0u)
+                {
+                    if (!IsBetweenInclusive(utf8Input[1], 0xA0u, 0xBFu))
+                    {
+                        // 3-byte sequence marker not followed by a valid continuation byte (or overlong)
+                        // maximally invalid subsequence of length 1
+                        bytesConsumed = 1;
+                        return SCALAR_INVALID;
+                    }
+                }
+                else if (IsBetweenInclusive(firstByte, 0xE1u, 0xECu))
+                {
+                    if (!IsBetweenInclusive(utf8Input[1], 0x80u, 0xBFu))
+                    {
+                        // 3-byte sequence marker not followed by a valid continuation byte
+                        // maximally invalid subsequence of length 1
+                        bytesConsumed = 1;
+                        return SCALAR_INVALID;
+                    }
+                }
+                else if (firstByte == 0xEDu)
+                {
+                    if (!IsBetweenInclusive(utf8Input[1], 0x80u, 0x9Fu))
+                    {
+                        // 3-byte sequence marker not followed by a valid continuation byte (or surrogate)
+                        // maximally invalid subsequence of length 1
+                        bytesConsumed = 1;
+                        return SCALAR_INVALID;
+                    }
+                }
+                else
+                {
+                    if (!IsBetweenInclusive(utf8Input[1], 0x80u, 0xBFu))
+                    {
+                        // 3-byte sequence marker not followed by a valid continuation byte
+                        // maximally invalid subsequence of length 1
+                        bytesConsumed = 1;
+                        return SCALAR_INVALID;
+                    }
+                }
+
+                // If we reached this point, the first two bytes are a valid subsequence.
+                // Only need to check now that the third (final) byte exists and is a continuation byte.
+
+                if (utf8Input.Length < 3)
+                {
+                    bytesConsumed = 2;
+                    return SCALAR_INCOMPLETE;
+                }
+
+                // only alternative was that the third byte wasn't a valid continuation byte
+                // that's a maximally invalid subsequence of length 2
+
+                bytesConsumed = 2;
+                return SCALAR_INVALID;
+            }
+
+            if (firstByte <= 0xF4u)
+            {
+                // 3-byte sequence marker
+
+                if (utf8Input.Length < 2)
+                {
+                    bytesConsumed = 1;
+                    return SCALAR_INCOMPLETE;
+                }
+
+                if (firstByte == 0xF0u)
+                {
+                    if (!IsBetweenInclusive(utf8Input[1], 0x90u, 0xBFu))
+                    {
+                        // 4-byte sequence marker not followed by a valid continuation byte (or overlong)
+                        // maximally invalid subsequence of length 1
+                        bytesConsumed = 1;
+                        return SCALAR_INVALID;
+                    }
+                }
+                else if (IsBetweenInclusive(firstByte, 0xF1u, 0xF3u))
+                {
+                    if (!IsBetweenInclusive(utf8Input[1], 0x80u, 0xBFu))
+                    {
+                        // 4-byte sequence marker not followed by a valid continuation byte
+                        // maximally invalid subsequence of length 1
+                        bytesConsumed = 1;
+                        return SCALAR_INVALID;
+                    }
+                }
+                else
+                {
+                    if (!IsBetweenInclusive(utf8Input[1], 0x80u, 0x8Fu))
+                    {
+                        // 4-byte sequence marker not followed by a valid continuation byte (or out-of-range)
+                        // maximally invalid subsequence of length 1
+                        bytesConsumed = 1;
+                        return SCALAR_INVALID;
+                    }
+                }
+
+                // If we reached this point, the first two bytes are a valid subsequence.
+                // Only need to check now that the third and fourth bytes exists and are continuation bytes.
+
+                if (utf8Input.Length < 3)
+                {
+                    bytesConsumed = 2;
+                    return SCALAR_INCOMPLETE;
+                }
+
+                if (!IsBetweenInclusive(utf8Input[2], 0x80u, 0xBFu))
+                {
+                    // 4-byte sequence marker with two valid starting bytes and a non-continuation third byte
+                    // maximally invalid subsequence of length 2
+                    bytesConsumed = 2;
+                    return SCALAR_INVALID;
+                }
+
+                // only alternative was that the fourth byte wasn't a valid continuation byte
+                // that's a maximally invalid subsequence of length 3
+
+                bytesConsumed = 3;
+                return SCALAR_INVALID;
+            }
+
+            // If we got to this point, the first byte of the sequence was F5..FF, which is never valid UTF-8.
+
             bytesConsumed = 1;
-            return SCALAR_INVALID;
-
-        ReturnInvalid2:
-            bytesConsumed = 2;
-            return SCALAR_INVALID;
-
-        ReturnInvalid3:
-            bytesConsumed = 3;
             return SCALAR_INVALID;
         }
 
@@ -237,6 +464,13 @@ namespace Escaper
 
             uint offset = (value - 10) >> 29; // = 0 if 'value' in [A..F]; = 7 if 'value' in [0..9]
             return value + 55 - offset;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsBetweenInclusive(uint value, uint lower, uint upper)
+        {
+            Debug.Assert(lower <= upper);
+            return (value - lower) <= (upper - lower);
         }
     }
 }
