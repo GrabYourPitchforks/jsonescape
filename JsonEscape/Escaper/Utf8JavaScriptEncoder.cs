@@ -12,9 +12,121 @@ namespace Escaper
 {
     public abstract class Utf8JavaScriptEncoder
     {
+        private readonly bool _replaceInvalidSequences;
+
+        protected Utf8JavaScriptEncoder(bool replaceInvalidSequences)
+        {
+            _replaceInvalidSequences = replaceInvalidSequences;
+        }
+
+        public int MaxOutputBytesPerRune => 12;
+
         public virtual OperationStatus Encode(ReadOnlySpan<byte> source, Span<byte> destination, out int numBytesConsumed, out int numBytesWritten, bool isFinalChunk = true)
         {
-            throw new NotImplementedException();
+            int tempNumBytesConsumed = 0;
+            int tempNumBytesWritten = 0;
+
+            while (!source.IsEmpty)
+            {
+                // First, run over the source buffer looking for the index of the first byte to encode.
+                // We'll memcpy as a single chunk all bytes that don't need to be encoded. To ensure the
+                // memcpy succeeds, and to ensure we don't inadvertently split a multi-byte UTF-8 subsequence,
+                // we need to truncate the source buffer temporarily.
+
+                {
+                    ReadOnlySpan<byte> sourceToScan = source;
+                    if (sourceToScan.Length > destination.Length)
+                    {
+                        sourceToScan = sourceToScan.Slice(0, destination.Length);
+                    }
+
+                    int numBytesToMemcpy = GetIndexOfFirstByteToEncode(sourceToScan);
+                    if (numBytesToMemcpy < 0)
+                    {
+                        numBytesToMemcpy = sourceToScan.Length;
+                    }
+
+                    sourceToScan.CopyTo(destination);
+                    source = source.Slice(numBytesToMemcpy);
+                    destination = destination.Slice(numBytesToMemcpy);
+
+                    tempNumBytesConsumed += numBytesToMemcpy;
+                    tempNumBytesWritten += numBytesToMemcpy;
+                }
+
+                // Quick check - did we consume all bytes from the source buffer?
+
+                if (source.IsEmpty)
+                {
+                    break;
+                }
+
+                // Decode the first scalar value from the input buffer. If it's an error, we'll fix it up later.
+
+                OperationStatus runeDecodeStatus = MissingRuneApis.DecodeFirstRuneFromUtf8(source, out Rune decodedRune, out int runeLengthInBytes);
+                if (runeDecodeStatus != OperationStatus.Done)
+                {
+                    Debug.Assert(runeDecodeStatus == OperationStatus.NeedMoreData || runeDecodeStatus == OperationStatus.InvalidData);
+
+                    // If the data was incomplete (but valid), return that same status to our caller
+                    // only if the caller told us to expect more data.
+
+                    if (!isFinalChunk && runeDecodeStatus == OperationStatus.NeedMoreData)
+                    {
+                        goto NeedsMoreData;
+                    }
+
+                    // We'll treat this as an error, which means we either fix it up on-the-fly (as U+FFFD)
+                    // or we return failure to our callers.
+
+                    if (!_replaceInvalidSequences)
+                    {
+                        goto InvalidData;
+                    }
+
+                    decodedRune = Rune.ReplacementChar;
+                }
+
+                // We've obtained the specific scalar value we need to escape; escape it now.
+
+                int escapedBytesWrittenThisIteration = EscapeRune(decodedRune, destination);
+                if (escapedBytesWrittenThisIteration < 0)
+                {
+                    goto DestinationTooSmall;
+                }
+
+                // When we bump the number of bytes consumed, we want to use the length returned by the "decode first rune"
+                // method, not Rune.Utf8SequenceLength. The reason is that when we see invalid data and replace it with
+                // U+FFFD in the output, calling Rune.Utf8SequenceLength on U+FFFD will always return 3 bytes, but the amount
+                // of invalid data we're skipping from the source buffer might have been of a different length.
+
+                tempNumBytesConsumed += runeLengthInBytes;
+                source = source.Slice(runeLengthInBytes);
+
+                tempNumBytesWritten += escapedBytesWrittenThisIteration;
+                destination = destination.Slice(escapedBytesWrittenThisIteration);
+            }
+
+            // If we fell out of the loop, we're done!
+
+            OperationStatus retVal = OperationStatus.Done;
+
+        ReturnCommon:
+            numBytesConsumed = tempNumBytesConsumed;
+            numBytesWritten = tempNumBytesWritten;
+            return retVal;
+
+        InvalidData:
+            retVal = OperationStatus.InvalidData;
+            goto ReturnCommon;
+
+        DestinationTooSmall:
+            retVal = OperationStatus.DestinationTooSmall;
+            goto ReturnCommon;
+
+        NeedsMoreData:
+            retVal = OperationStatus.NeedMoreData;
+            goto ReturnCommon;
         }
 
         public abstract int GetIndexOfFirstByteToEncode(ReadOnlySpan<byte> buffer);
